@@ -79,52 +79,94 @@ if __name__ == '__main__':
         print('Failed to establish a connection to MongoDb. Shutting down.')
         exit(1)
 
-    print('Found {!s} documents to index\n'.format(len(data)))
+    val = ""
+    while not (val.strip().lower() == 'i' or val.strip().lower() == 's'):
+        val = input('Do you want to index or search? (i/s)\n').strip().lower()
 
-    val = input('Do you want to clear the index?\n')
-    if val.lower() in ['y', 'yes']:
-        posts.drop()
+    if val == 'i':
+        print('Found {!s} documents to index\n'.format(len(data)))
+        val = input('Do you want to clear the index first? (y/n)\n')
+        if val.lower() in ['y', 'yes']:
+            posts.drop()
+            posts.create_index("term")
 
-    start = timer()
-    for documentId in data:
-        termFrequencies = getTermFrequencies(documentId, data[documentId])
-        for term, termFrequency in termFrequencies.items():
-            document = posts.find_one({"term": term})
-            # The term is already in the database
-            if document is not None:
-                # List of lists where each list corresponds to a document
-                postings = document['postings']
-                # Calculate the inverse document frequency (idf) for this term
-                docsWithTerm = len(postings) + 1
-                idf = log(totalDocuments / docsWithTerm)
+        startIndex = 0
+        endIndex = 0
+        while True:
+            val = input('Enter the document indices to index: (start:end)\n')
+            if not val:  # If they leave it blank then index everything
+                startIndex = 0
+                endIndex = len(data) - 1
+                break
 
-                # Update the tf-idf score for all documents because we are adding a new document
-                for posting in postings:
-                    posting[2] = posting[1] * idf
-                # Add our new document
-                postings.append([documentId, termFrequency, termFrequency * idf])
-                document['postings'] = postings
+            split = val.split(':')
+            s = split[0]
+            e = split[1]
+            if not s.isdigit() or not e.isdigit():
+                print('Indices must be numbers\n')
+                continue
+            startIndex = int(s)
+            endIndex = int(e)
 
-                posts.replace_one({'term': term}, document)
-            else:  # The term is not in the database
-                # Inverse document frequency (idf) is pretty easy when there is only one document so far
-                idf = log(totalDocuments)
-                post = {"term": term,
-                        "postings": [[documentId, termFrequency, termFrequency * idf]]}
-                posts.insert_one(post)
+            if startIndex < 0 or endIndex >= len(data) or startIndex > endIndex:
+                print(
+                    'Start index must be greater than zero and less than end index. End index must be less than {!s}\n'
+                        .format(len(data)))
+                continue
+            break
 
-    end = timer()
-    print('We indexed {!s} terms in {!s} seconds\n'.format(posts.count(), end - start))
+        start = timer()
+        index = -1
+        totalTermsIndexed = 0
+        newTermsIndexed = 0
+        for documentId in data:
+            index += 1
+            if index > endIndex:
+                break
 
+            if index >= startIndex:
+                termFrequencies = getTermFrequencies(documentId, data[documentId])
+                for term, termFrequency in termFrequencies.items():
+                    totalTermsIndexed += 1
+                    document = posts.find_one({"term": term})
+                    # The term is already in the database
+                    if document is not None:
+                        # List of lists where each list corresponds to a document
+                        postings = document['postings']
+                        # Calculate the inverse document frequency (idf) for this term
+                        docsWithTerm = len(postings) + 1
+                        idf = log(totalDocuments / docsWithTerm)
+
+                        # Update the tf-idf score for all documents because we are adding a new document
+                        for posting in postings:
+                            posting[2] = posting[1] * idf
+                        # Add our new document
+                        postings.append([documentId, termFrequency, termFrequency * idf])
+                        document['postings'] = postings
+
+                        posts.replace_one({'term': term}, document)
+                    else:  # The term is not in the database
+                        newTermsIndexed += 1
+                        # Inverse document frequency (idf) is pretty easy when there is only one document so far
+                        idf = log(totalDocuments)
+                        post = {"term": term,
+                                "postings": [[documentId, termFrequency, termFrequency * idf]]}
+                        posts.insert_one(post)
+
+        end = timer()
+        print('We indexed {!s} documents with {!s} total terms and {!s} new terms in {!s} seconds\n'.format(
+            endIndex - startIndex, totalTermsIndexed, newTermsIndexed, end - start))
+
+    totalTermsInDb = posts.count()
     inputVal = ""
     while inputVal != 'fuckingquit':
-        inputVal = input('Enter a word to query:\n').lower().strip()
+        inputVal = input('Enter a term to query ({!s} possible):\n'.format(totalTermsInDb)).lower().strip()
         if " " in inputVal:
             print('No spaces allowed')
             continue
         document = posts.find_one({"term": inputVal})
         if document is None:
-            print("Could not find the word '{!s}' in the index".format(inputVal))
+            print("Could not find the term '{!s}' in the index".format(inputVal))
             continue
         for index, posting in enumerate(document['postings']):
-            print("{!s}: {!s} -- {!s}".format(index + 1, data[posting[0]], posting[2]))
+            print("{!s}: {!s} -- {!s} -- ({!s})".format(index + 1, data[posting[0]], posting[2], posting[0]))
