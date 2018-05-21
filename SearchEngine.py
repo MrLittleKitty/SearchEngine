@@ -33,7 +33,7 @@ def getInverseDocumentFrequency(documentsWithWord, totalDocuments):
     return float(log(totalDocuments / documentsWithWord))
 
 
-def getTermFrequencies(identifier, url):
+def getTermFrequenciesAndLength(identifier, url):
     totalTerms = 0
     terms = defaultdict(lambda: 0)
     try:
@@ -52,18 +52,18 @@ def getTermFrequencies(identifier, url):
         content = None
 
         try:
-            with open("WEBPAGES_RAW/" + identifier) as fp:
+            with open("WEBPAGES_RAW/" + identifier, encoding='utf-8', errors='ignore') as fp:
                 content = fp.readlines()
         except UnicodeDecodeError:
             print('Failed to decode url (id: {!s}): {!s}'.format(identifier, url))
-            return {}
+            return ({}, 0)
 
         for line in content:
             for term in iterTerms(line):
                 terms[term] = terms[term] + 1
                 totalTerms += 1
 
-    return {key: getTermFrequency(value, totalTerms) for key, value in terms.items()}
+    return (dict(terms), totalTerms)
 
 
 def searchForQuery(posts, query, totalDocumentsCount) -> [str]:
@@ -102,15 +102,27 @@ def searchForQuery(posts, query, totalDocumentsCount) -> [str]:
             if term != word:  # Don't care about the same word
                 # Go through all the docIDs in this posting list
                 for i in range(len(postingList) - 1, -1, -1):
-                    docID, termFrequency, tfidf = postingList[i]
+                    docID, termCount, documentLength = postingList[i]
                     # If other documents from other terms don't have this word in them, then we don't care about them
                     if not isInMasterList(docID):
                         postingList.pop(i)
     scores = {}
-    magnitudes = {}
+    docLengths = {}
+    for word in words:
+        posting, idf = postingsDict[word]
+        for docID, termCount, documentLength in posting:
+            tfidf = idf * getTermFrequency(termCount, documentLength)
+            if docID in scores:
+                scores[docID] = scores[docID] + (queryTfIdfs[word] * tfidf)
+            else:
+                scores[docID] = (queryTfIdfs[word] * tfidf)
+            docLengths[docID] = documentLength
 
-    # Sort by idf and put high idf terms at the front
-    # postings.sort(key=lambda posting: -1 * posting[1])
+    for docID in scores.keys():
+        scores[docID] = scores[docID] / docLengths[docID]
+
+    ids = sorted([(key, value) for key, value in scores.items()], key=lambda x: -1 * x[1])
+    return ids
 
 
 if __name__ == '__main__':
@@ -128,8 +140,8 @@ if __name__ == '__main__':
     posts = None
     try:
         client = MongoClient('localhost', 27017)
-        db = client['test-index']
-        posts = db['term-collection']
+        db = client['test-index2']
+        posts = db['term-collection2']
     except:
         print('Failed to establish a connection to MongoDb. Shutting down.')
         exit(1)
@@ -174,44 +186,53 @@ if __name__ == '__main__':
             start = timer()
             index = -1
             totalTermsIndexed = 0
-            newTermsIndexed = 0
+            postingCache = {}
+            postingCacheSize = 200000
+
+
+            def saveCache():
+                print('Beginning to flush the postings cache of {!s} terms to the database'.format(
+                    postingCacheSize))
+                for term, posting in postingCache.items():
+                    document = posts.find_one({"term": term})
+                    # The term is already in the database
+                    if document is not None:
+                        # List of lists where each list corresponds to a document
+                        postings = document['postings']
+                        # Add our new document
+                        postings.extend(posting)
+                        document['postings'] = postings
+
+                        posts.replace_one({'term': term}, document)
+                    else:  # The term is not in the database
+                        post = {"term": term,
+                                "postings": posting}
+                        posts.insert_one(post)
+                postingCache.clear()
+                print('Finished flushing the postings cache of {!s} terms'.format(postingCacheSize))
+
+
+            postingCache.clear()
             for documentId in data:
                 index += 1
                 if index > endIndex:
                     break
-
                 if index >= startIndex:
-                    termFrequencies = getTermFrequencies(documentId, data[documentId])
-                    for term, termFrequency in termFrequencies.items():
+                    termCounts, documentLength = getTermFrequenciesAndLength(documentId, data[documentId])
+                    for term, termCount in termCounts.items():
                         totalTermsIndexed += 1
-                        document = posts.find_one({"term": term})
-                        # The term is already in the database
-                        if document is not None:
-                            # List of lists where each list corresponds to a document
-                            postings = document['postings']
-                            # Calculate the inverse document frequency (idf) for this term
-                            docsWithTerm = len(postings) + 1
-                            idf = getInverseDocumentFrequency(docsWithTerm, totalDocuments)
-
-                            # Update the tf-idf score for all documents because we are adding a new document
-                            for posting in postings:
-                                posting[2] = posting[1] * idf
-                            # Add our new document
-                            postings.append([documentId, termFrequency, termFrequency * idf])
-                            document['postings'] = postings
-
-                            posts.replace_one({'term': term}, document)
-                        else:  # The term is not in the database
-                            newTermsIndexed += 1
-                            # Inverse document frequency (idf) is pretty easy when there is only one document so far
-                            idf = log(totalDocuments)
-                            post = {"term": term,
-                                    "postings": [[documentId, termFrequency, termFrequency * idf]]}
-                            posts.insert_one(post)
-
+                        if term in postingCache:
+                            postingCache[term].append([documentId, termCount, documentLength])
+                        else:
+                            postingCache[term] = [[documentId, termCount, documentLength]]
+                    if len(postingCache) > postingCacheSize:
+                        print('Saving cache at index: {!s}'.format(index))
+                        saveCache()
+            print('Saving final cache')
+            saveCache()
             end = timer()
-            print('We indexed {!s} documents with {!s} total terms and {!s} new terms in {!s} seconds\n'.format(
-                endIndex - startIndex, totalTermsIndexed, newTermsIndexed, end - start))
+            print('We indexed {!s} documents with {!s} total terms in {!s} seconds\n'.format(
+                endIndex - startIndex, totalTermsIndexed, end - start))
 
     totalTermsInDb = posts.count()
     while True:
@@ -220,5 +241,7 @@ if __name__ == '__main__':
             break
         ids = searchForQuery(posts, inputVal, totalDocuments)
         if ids is not None and len(ids) > 0:
-            for index, id in enumerate(ids):
-                print('{!s}: {!s}'.format(index + 1, data[id]))
+            for index, (id, tfidf) in enumerate(ids):
+                if index >= 20:
+                    break
+                print('{!s}: {!s} - {!s}'.format(index + 1, id, data[id]))
